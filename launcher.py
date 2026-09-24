@@ -7,6 +7,7 @@ import subprocess
 import sys
 import queue
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
@@ -115,6 +116,13 @@ def load_project_urls(profiles: dict[str, str]) -> dict[str, str]:
     return urls
 
 
+def bot_config() -> dict:
+    try:
+        return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
 def load_profiles() -> dict[str, str]:
     if PROFILES_FILE.exists():
         return json.loads(PROFILES_FILE.read_text(encoding="utf-8"))
@@ -154,6 +162,8 @@ class FlowBotApp(tk.Tk):
         self.rotation: list[str] = []
         self.rotation_index = 0
         self.pending_launch: str | None = None
+        self.retry_done = False
+        self.progress_start: tuple[float, int] | None = None
         self.output: queue.Queue = queue.Queue()
         self.after(100, self._poll_output)
         self._build()
@@ -461,12 +471,32 @@ class FlowBotApp(tk.Tk):
         self.log.see("end")
         self.log.configure(state="disabled")
         if any(key in value for key in ("PROGRES ", "FILE ", "KARAKTER ", "CEK KARAKTER")):
-            self.status_var.set(value.split("| INFO |")[-1].strip()[:140])
+            text = value.split("| INFO |")[-1].strip()[:140]
+            eta = self.progress_eta(value)
+            self.status_var.set(text + (f"  •  sisa ±{eta}" if eta else ""))
+
+    def progress_eta(self, line: str) -> str:
+        """Perkiraan sisa waktu dari baris 'PROGRES n/total' (rata-rata waktu per prompt)."""
+        found = re.search(r"PROGRES (\d+)/(\d+)", line)
+        if not found:
+            return ""
+        done, total = int(found.group(1)) - 1, int(found.group(2))
+        now = time.monotonic()
+        if self.progress_start is None or done < self.progress_start[1]:
+            self.progress_start = (now, done)
+            return ""
+        started, first = self.progress_start
+        if done - first < 2:
+            return ""
+        seconds = (now - started) / (done - first) * (total - done)
+        hours, minutes = int(seconds // 3600), int(seconds % 3600 // 60)
+        return f"{hours} j {minutes} m" if hours else f"{max(1, minutes)} menit"
 
     def run_worker(self, job: str, args: list[str], status: str) -> None:
         reload_modules()
         self.job = job
         self.set_busy(True)
+        self.progress_start = None
         self.status_var.set(status)
         self.append_log(f"\n=== {status} ===\n")
         env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
@@ -505,10 +535,13 @@ class FlowBotApp(tk.Tk):
                 "atau kolom Prompt kosong. Kosongkan sel STATUS untuk mengulang scene tertentu.",
             )
             return
+        if not self.confirm_excel_closed():
+            return
         name = self.profile_var.get()
         url = self.ensure_url(name)
         if not url:
             return
+        self.retry_done = False
         self.save_rotation()
         self.rotation = [name]
         if self.rotate_var.get():
@@ -530,6 +563,53 @@ class FlowBotApp(tk.Tk):
                 self.append_log("INFO: Pindah profil otomatis aktif, tetapi belum ada profil lain yang dipilih/punya URL.\n")
         self.rotation_index = 0
         self.launch_generate()
+
+    @staticmethod
+    def excel_is_open(path: Path) -> bool:
+        """Excel sedang membuka file ini? (file kunci ~$... atau file tidak bisa ditulis)."""
+        if path.suffix.casefold() not in {".xlsx", ".xlsm"}:
+            return False
+        locks = {path.with_name("~$" + path.name), path.with_name("~$" + path.name[2:])}
+        if any(lock.exists() for lock in locks):
+            return True
+        try:
+            with path.open("r+b"):
+                return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+
+    def confirm_excel_closed(self) -> bool:
+        opened = [path.name for path in self.files if self.excel_is_open(path)]
+        if not opened:
+            return True
+        return messagebox.askyesno(
+            "Excel sedang dibuka",
+            "File ini sedang dibuka di Excel:\n\n" + "\n".join(f"• {n}" for n in opened)
+            + "\n\nSebaiknya tutup dulu (simpan perubahan Anda) supaya tanda STATUS langsung masuk ke file asli. "
+            "Kalau tetap lanjut, tanda disimpan sementara di <nama>_TANDA.xlsx dan otomatis digabung "
+            "ke file asli pada run berikutnya.\n\nLanjut tanpa menutup Excel?",
+        )
+
+    def summary_lines(self) -> tuple[str, int, int]:
+        """Ringkasan status per Excel, jumlah scene yang masih bisa diulang (GAGAL/belum),
+        dan jumlah scene yang sudah punya gambar (SELESAI/SEBAGIAN)."""
+        config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        lines, retry, good = [], 0, 0
+        for path in self.files:
+            try:
+                c = bot.status_summary(path, config)
+            except Exception as exc:
+                lines.append(f"{path.name}: tidak terbaca ({exc})")
+                continue
+            retry += c["gagal"] + c["belum"]
+            good += c["selesai"] + c["sebagian"]
+            lines.append(
+                f"{path.name}: SELESAI {c['selesai']} • SEBAGIAN {c['sebagian']} • GAGAL {c['gagal']}"
+                f" • DITOLAK {c['ditolak']} • BELUM {c['belum']}"
+            )
+        return "\n".join(lines), retry, good
 
     def launch_generate(self) -> None:
         self.pending_launch = None
@@ -555,6 +635,7 @@ class FlowBotApp(tk.Tk):
         assert process.stdout is not None
         for line in process.stdout:
             self.output.put(("line", line))
+        process.stdout.close()
         self.output.put(("exit", process.wait()))
 
     def _poll_output(self) -> None:
@@ -621,9 +702,29 @@ class FlowBotApp(tk.Tk):
             self.job = "generate"  # tahan tombol sampai profil berikutnya berjalan
             self.pending_launch = self.after(3000, self.launch_generate)
             return
+        summary, retry, good = ("", 0, 0)
+        try:
+            summary, retry, good = self.summary_lines()
+        except Exception as exc:
+            self.append_log(f"INFO: ringkasan belum bisa dibuat: {exc}\n")
+        if (code == 0 and retry and good and not self.retry_done and self.rotation_index < len(self.rotation)
+                and bot_config().get("auto_retry_failed", True)):
+            # Ulang otomatis SEKALI untuk scene GAGAL (error sementara), dengan profil yang sama.
+            # Tidak dilakukan bila tidak ada satu pun scene berhasil (masalahnya bukan sementara).
+            self.retry_done = True
+            self.append_log(f"\n=== ULANG OTOMATIS | {retry} scene GAGAL/belum jadi dicoba sekali lagi ===\n")
+            self.set_busy(True)
+            self.job = "generate"
+            self.pending_launch = self.after(3000, self.launch_generate)
+            return
+        if summary:
+            self.append_log("\n=== RINGKASAN ===\n" + summary + "\n")
         self.status_var.set("Semua selesai" if code == 0 else f"Berhenti dengan kode {code}")
         if code == 0:
-            messagebox.showinfo("Selesai", "Semua file yang dipilih sudah diproses.")
+            messagebox.showinfo(
+                "Selesai", "Semua file yang dipilih sudah diproses.\n\n" + summary
+                + ("\n\nScene GAGAL bisa diulang dengan klik Mulai lagi." if retry else ""),
+            )
         elif code == 5:
             messagebox.showerror(
                 "Pergantian model gagal",
