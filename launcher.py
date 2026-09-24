@@ -1,0 +1,1007 @@
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import queue
+import threading
+import tkinter as tk
+from pathlib import Path
+from tkinter import filedialog, messagebox, simpledialog, ttk
+
+APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+
+
+def _run_external_launcher() -> None:
+    """EXE menjalankan launcher.py di samping EXE (bila ada) agar tampilan
+    aplikasi bisa diperbarui tanpa build ulang. Gagal -> pakai versi bawaan."""
+    if (not getattr(sys, "frozen", False) or globals().get("__FLOWBOT_EXTERNAL__")
+            or getattr(sys, "_flowbot_external", False)):
+        return
+    path = APP_DIR / "launcher.py"
+    if not path.is_file():
+        return
+    try:
+        code = compile(path.read_text(encoding="utf-8"), str(path), "exec")
+    except Exception as exc:
+        print(f"INFO: launcher.py eksternal tidak valid ({exc}); memakai versi bawaan EXE.")
+        return
+    sys._flowbot_external = True  # type: ignore[attr-defined]
+    namespace = {"__name__": "__main__", "__file__": str(path), "__FLOWBOT_EXTERNAL__": True}
+    exec(code, namespace)
+    raise SystemExit(0)
+
+
+_run_external_launcher()
+
+
+def _load_external_module(name: str) -> None:
+    """Pada EXE, pakai bot.py/capcut_plan.py di samping EXE bila ada.
+
+    Dengan begitu perbaikan kode cukup mengganti file .py tanpa build ulang.
+    Jika file eksternal gagal dimuat, modul bawaan EXE tetap dipakai.
+    """
+    if not getattr(sys, "frozen", False):
+        return
+    path = APP_DIR / f"{name}.py"
+    if not path.is_file():
+        return
+    import importlib.util
+
+    try:
+        spec = importlib.util.spec_from_file_location(name, path)
+        if spec is None or spec.loader is None:
+            return
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    except Exception as exc:  # pragma: no cover - fallback ke modul bawaan
+        sys.modules.pop(name, None)
+        print(f"INFO: {path.name} eksternal gagal dimuat ({exc}); memakai versi bawaan EXE.")
+
+
+_load_external_module("bot")
+_load_external_module("capcut_plan")
+
+import bot  # noqa: E402
+import capcut_plan  # noqa: E402
+
+
+def reload_modules() -> None:
+    """Muat ulang bot.py/capcut_plan.py terbaru (tanpa menutup aplikasi)."""
+    global bot, capcut_plan
+    import importlib
+
+    for name in ("bot", "capcut_plan"):
+        if getattr(sys, "frozen", False):
+            _load_external_module(name)
+        else:
+            try:
+                importlib.reload(sys.modules[name])
+            except Exception as exc:
+                print(f"INFO: {name}.py gagal dimuat ulang ({exc})")
+    bot = sys.modules["bot"]
+    capcut_plan = sys.modules["capcut_plan"]
+
+PROFILES_FILE = APP_DIR / "profiles.json"
+CONFIG_FILE = APP_DIR / "config.json"
+PROJECT_URLS_FILE = APP_DIR / "profile_urls.json"
+ROTATION_FILE = APP_DIR / "profile_rotation.json"
+PROJECT_URL_PATTERN = re.compile(r"^https://[^\s/]+/(?:[^\s?#]*/)?project/[A-Za-z0-9-]{8,}", re.IGNORECASE)
+
+
+def load_project_urls(profiles: dict[str, str]) -> dict[str, str]:
+    """URL project Flow per profil. Project Flow hanya bisa dibuka akun pemiliknya."""
+    urls: dict[str, str] = {}
+    if PROJECT_URLS_FILE.exists():
+        try:
+            urls = json.loads(PROJECT_URLS_FILE.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            urls = {}
+    if not urls:
+        # Migrasi: URL lama di config.json milik profil yang memakai profile_dir config.
+        try:
+            config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            owner_dir = str(config.get("profile_dir", "runtime/browser-profile")).replace("\\", "/")
+            for name, path in profiles.items():
+                if str(path).replace("\\", "/") == owner_dir and config.get("url"):
+                    urls[name] = config["url"]
+            if urls:
+                PROJECT_URLS_FILE.write_text(json.dumps(urls, indent=2), encoding="utf-8")
+        except (OSError, ValueError):
+            pass
+    return urls
+
+
+def load_profiles() -> dict[str, str]:
+    if PROFILES_FILE.exists():
+        return json.loads(PROFILES_FILE.read_text(encoding="utf-8"))
+    profiles = {"Renegade Immortal": "runtime/browser-profile"}
+    PROFILES_FILE.write_text(json.dumps(profiles, indent=2), encoding="utf-8")
+    return profiles
+
+
+def worker_command(extra: list[str]) -> list[str]:
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "--worker", *extra]
+    return [sys.executable, str(Path(__file__).resolve()), "--worker", *extra]
+
+
+
+
+CHARACTER_ROOT = APP_DIR / "downloads" / "_KARAKTER"
+
+
+def safe_name(value: str) -> str:
+    return re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", str(value)).strip(" .") or "karakter"
+
+
+class FlowBotApp(tk.Tk):
+    def __init__(self) -> None:
+        super().__init__()
+        self.title("Flow Bot v8 - Generate Gambar & Pindah Karakter")
+        self.geometry("980x720")
+        self.minsize(860, 620)
+        self.profiles = load_profiles()
+        self.project_urls = load_project_urls(self.profiles)
+        self.project_var = tk.StringVar()
+        self.files: list[Path] = []
+        self.process: subprocess.Popen[str] | None = None
+        self.job = ""
+        self.job_info: dict[str, str] = {}
+        if not self.profiles:
+            self.profiles = {"Profil 1": "runtime/browser-profile"}
+            PROFILES_FILE.write_text(json.dumps(self.profiles, indent=2), encoding="utf-8")
+        names = list(self.profiles)
+        self.profile_var = tk.StringVar(value=names[0])
+        self.source_var = tk.StringVar(value=names[0])
+        self.target_var = tk.StringVar(value=names[1] if len(names) > 1 else names[0])
+        self.summary_var = tk.StringVar(value="Belum ada Excel dipilih")
+        self.status_var = tk.StringVar(value="Siap")
+        self.char_info_var = tk.StringVar(value="Pilih profil sumber dan tujuan, lalu klik '1. Cek karakter'.")
+        self.missing: list[str] = []
+        self.rotate_var = tk.BooleanVar(value=False)
+        self.rotation: list[str] = []
+        self.rotation_index = 0
+        self.pending_launch: str | None = None
+        self.job_done: set[str] = set()
+        self.job_picked: list[str] = []
+        self.output: queue.Queue = queue.Queue()
+        self.after(100, self._poll_output)
+        self._build()
+        self.load_data_files()
+        self.load_last_compare()
+
+    # ------------------------------------------------------------------ UI
+    def _build(self) -> None:
+        style = ttk.Style(self)
+        try:
+            style.configure("Big.TButton", padding=(10, 6))
+            style.configure("Head.TLabel", font=("Segoe UI", 10, "bold"))
+        except tk.TclError:
+            pass
+        outer = ttk.Frame(self, padding=12)
+        outer.pack(fill="both", expand=True)
+
+        profile_box = ttk.LabelFrame(outer, text="Profil Google / Chrome", padding=10)
+        profile_box.pack(fill="x")
+        ttk.Label(profile_box, text="Profil:").pack(side="left")
+        self.profile_combo = ttk.Combobox(profile_box, textvariable=self.profile_var, state="readonly", width=28)
+        self.profile_combo.pack(side="left", padx=(4, 8))
+        ttk.Button(profile_box, text="Tambah profil", command=self.add_profile).pack(side="left", padx=3)
+        ttk.Button(profile_box, text="Login profil", command=self.login_profile).pack(side="left", padx=3)
+        ttk.Button(profile_box, text="URL project", command=self.set_project_url).pack(side="left", padx=3)
+        ttk.Label(profile_box, textvariable=self.project_var, foreground="#555").pack(side="left", padx=8)
+        self.profile_combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh_project_label())
+
+        self.tabs = ttk.Notebook(outer)
+        self.tabs.pack(fill="x", pady=(10, 0))
+        gen = ttk.Frame(self.tabs, padding=10)
+        char = ttk.Frame(self.tabs, padding=10)
+        self.tabs.add(gen, text="  Generate Gambar  ")
+        self.tabs.add(char, text="  Pindah Karakter antar Profil  ")
+        self._build_generate(gen)
+        self._build_characters(char)
+
+        bottom = ttk.Frame(outer)
+        bottom.pack(fill="x", pady=(8, 0))
+        self.stop_button = ttk.Button(bottom, text="Hentikan", command=self.stop, state="disabled")
+        self.stop_button.pack(side="left")
+        ttk.Label(bottom, textvariable=self.status_var).pack(side="left", padx=10)
+
+        log_box = ttk.LabelFrame(outer, text="Progres", padding=8)
+        log_box.pack(fill="both", expand=True, pady=(6, 0))
+        self.log = tk.Text(log_box, wrap="word", state="disabled", font=("Consolas", 10), height=10)
+        scroll = ttk.Scrollbar(log_box, command=self.log.yview)
+        self.log.configure(yscrollcommand=scroll.set)
+        self.log.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        self.refresh_profile_lists()
+
+    def _build_generate(self, parent: ttk.Frame) -> None:
+        ttk.Label(parent, text="Generate memakai profil yang dipilih di atas.", foreground="#555").pack(anchor="w")
+        buttons = ttk.Frame(parent)
+        buttons.pack(fill="x", pady=(6, 0))
+        ttk.Button(buttons, text="Tambah Excel", command=self.add_files).pack(side="left", padx=(0, 5))
+        ttk.Button(buttons, text="Hapus pilihan", command=self.remove_files).pack(side="left", padx=5)
+        ttk.Button(buttons, text="Naik", command=lambda: self.move_file(-1)).pack(side="left", padx=5)
+        ttk.Button(buttons, text="Turun", command=lambda: self.move_file(1)).pack(side="left", padx=5)
+        self.file_list = tk.Listbox(parent, height=7, selectmode="extended")
+        self.file_list.pack(fill="x", pady=(8, 4))
+        ttk.Label(parent, textvariable=self.summary_var).pack(anchor="w")
+        rotate_box = ttk.LabelFrame(parent, text="Pindah profil otomatis", padding=6)
+        rotate_box.pack(fill="x", pady=(8, 0))
+        ttk.Checkbutton(
+            rotate_box, variable=self.rotate_var, command=self.save_rotation,
+            text="Aktif. Nano Banana 2 → (kredit habis/pembatasan) → Nano Banana 2 Lite → (gagal 2x berturut-turut) "
+                 "→ profil berikutnya. Semua profil gagal → bot berhenti",
+        ).pack(anchor="w")
+        row = ttk.Frame(rotate_box)
+        row.pack(fill="x", pady=(4, 0))
+        ttk.Label(row, text="Profil bergantian (klik untuk pilih/lepas).\nMulai dari profil di atas,\nlalu sesuai urutan daftar:",
+                  foreground="#555").pack(side="left", anchor="n")
+        self.rotation_list = tk.Listbox(row, height=4, selectmode="multiple", exportselection=False)
+        self.rotation_list.pack(side="left", fill="x", expand=True, padx=(8, 0))
+        self.rotation_list.bind("<<ListboxSelect>>", lambda _e: self.save_rotation())
+        run_box = ttk.Frame(parent)
+        run_box.pack(fill="x", pady=(8, 0))
+        self.start_button = ttk.Button(run_box, text="▶  Mulai generate", style="Big.TButton", command=self.start)
+        self.start_button.pack(side="left")
+        self.capcut_button = ttk.Button(run_box, text="Buat Urutan CapCut", style="Big.TButton", command=self.make_capcut)
+        self.capcut_button.pack(side="left", padx=8)
+        ttk.Button(run_box, text="Buka folder hasil", command=lambda: self.open_folder(APP_DIR / "downloads")).pack(side="left")
+
+    def _build_characters(self, parent: ttk.Frame) -> None:
+        pick = ttk.Frame(parent)
+        pick.pack(fill="x")
+        ttk.Label(pick, text="Dari profil (A):", style="Head.TLabel").pack(side="left")
+        self.source_combo = ttk.Combobox(pick, textvariable=self.source_var, state="readonly", width=24)
+        self.source_combo.pack(side="left", padx=(4, 8))
+        ttk.Button(pick, text="Tukar", width=6, command=self.swap_profiles).pack(side="left")
+        ttk.Label(pick, text="Ke profil (B):", style="Head.TLabel").pack(side="left", padx=(8, 0))
+        self.target_combo = ttk.Combobox(pick, textvariable=self.target_var, state="readonly", width=24)
+        self.target_combo.pack(side="left", padx=4)
+        for combo in (self.source_combo, self.target_combo):
+            combo.bind("<<ComboboxSelected>>", lambda _event: self.load_last_compare())
+
+        steps = ttk.Frame(parent)
+        steps.pack(fill="x", pady=(8, 0))
+        self.compare_button = ttk.Button(steps, text="1. Cek karakter", style="Big.TButton", command=self.compare_characters)
+        self.compare_button.pack(side="left")
+        self.transfer_button = ttk.Button(steps, text="2. Pindahkan yang dipilih", style="Big.TButton",
+                                          command=self.transfer_characters, state="disabled")
+        self.transfer_button.pack(side="left", padx=8)
+        ttk.Button(steps, text="Pilih semua", command=self.select_all_missing).pack(side="left")
+        ttk.Button(steps, text="Buka folder karakter", command=self.open_character_folder).pack(side="left", padx=8)
+        self.clean_button = ttk.Button(
+            steps, text="Hapus karakter tanpa nama", command=self.clean_untitled
+        )
+        self.clean_button.pack(side="left")
+
+        lists = ttk.Frame(parent)
+        lists.pack(fill="x", pady=(8, 0))
+        left = ttk.Frame(lists)
+        left.pack(side="left", fill="both", expand=True, padx=(0, 6))
+        right = ttk.Frame(lists)
+        right.pack(side="left", fill="both", expand=True, padx=(6, 0))
+        ttk.Label(left, text="BELUM ADA di tujuan (akan dipindah):", style="Head.TLabel").pack(anchor="w")
+        self.missing_list = tk.Listbox(left, height=8, selectmode="extended", exportselection=False)
+        self.missing_list.pack(fill="both", expand=True)
+        ttk.Label(right, text="SUDAH ADA di tujuan (dilewati):", style="Head.TLabel").pack(anchor="w")
+        self.existing_list = tk.Listbox(right, height=8, foreground="#777", exportselection=False)
+        self.existing_list.pack(fill="both", expand=True)
+        ttk.Label(parent, textvariable=self.char_info_var, foreground="#555", wraplength=900).pack(anchor="w", pady=(6, 0))
+
+    def refresh_profile_lists(self) -> None:
+        names = list(self.profiles)
+        for combo in (self.profile_combo, self.source_combo, self.target_combo):
+            combo["values"] = names
+        self.refresh_project_label()
+        self.load_rotation()
+
+    def load_rotation(self) -> None:
+        saved: dict = {}
+        if ROTATION_FILE.exists():
+            try:
+                saved = json.loads(ROTATION_FILE.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                saved = {}
+        chosen = saved.get("profiles") if "profiles" in saved else None  # belum pernah disimpan -> semua
+        self.rotate_var.set(bool(saved.get("enabled", False)))
+        last = saved.get("last_profile")
+        if last in self.profiles and not getattr(self, "_last_restored", False):
+            # Mulai dari profil terakhir yang dipakai (berkelanjutan, tidak mengulang dari awal).
+            self._last_restored = True
+            self.profile_var.set(last)
+            self.refresh_project_label()
+        self.rotation_list.delete(0, "end")
+        for index, name in enumerate(self.profiles):
+            self.rotation_list.insert("end", name)
+            if chosen is None or name in chosen:
+                self.rotation_list.selection_set(index)
+        if (last not in self.profiles and chosen and self.rotate_var.get()
+                and not getattr(self, "_last_restored", False)):
+            # Belum ada riwayat: mulai dari profil pertama yang dipilih untuk rotasi.
+            first = next((n for n in self.profiles if n in chosen), None)
+            if first:
+                self._last_restored = True
+                self.profile_var.set(first)
+                self.refresh_project_label()
+
+    def save_rotation(self, last_profile: str | None = None) -> None:
+        previous: dict = {}
+        if ROTATION_FILE.exists():
+            try:
+                previous = json.loads(ROTATION_FILE.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                previous = {}
+        data = {
+            "enabled": bool(self.rotate_var.get()),
+            "profiles": [self.rotation_list.get(i) for i in self.rotation_list.curselection()],
+            "last_profile": last_profile or previous.get("last_profile"),
+        }
+        try:
+            ROTATION_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            pass
+
+    def set_busy(self, busy: bool) -> None:
+        state = "disabled" if busy else "normal"
+        for button in (self.start_button, self.capcut_button, self.compare_button, self.clean_button):
+            button.configure(state=state)
+        self.transfer_button.configure(state="disabled" if busy or not self.missing else "normal")
+        self.stop_button.configure(state="normal" if busy else "disabled")
+
+    @staticmethod
+    def open_folder(path: Path) -> None:
+        path.mkdir(parents=True, exist_ok=True)
+        if hasattr(os, "startfile"):
+            os.startfile(str(path))  # type: ignore[attr-defined]
+        else:
+            subprocess.Popen(["xdg-open", str(path)])
+
+    # ------------------------------------------------------------ profiles
+    def add_profile(self) -> None:
+        name = simpledialog.askstring("Tambah profil", "Nama profil (contoh: Google Kedua):", parent=self)
+        if not name or not name.strip():
+            return
+        name = name.strip()
+        slug = re.sub(r"[^a-z0-9]+", "-", name.casefold()).strip("-") or "profile"
+        path = f"runtime/profiles/{slug}"
+        self.profiles[name] = path
+        PROFILES_FILE.write_text(json.dumps(self.profiles, indent=2), encoding="utf-8")
+        self.profile_var.set(name)
+        chosen = [self.rotation_list.get(i) for i in self.rotation_list.curselection()]
+        self.refresh_profile_lists()
+        for index, item in enumerate(self.profiles):
+            if item in chosen or item == name:
+                self.rotation_list.selection_set(index)
+        self.save_rotation()
+        messagebox.showinfo(
+            "Profil ditambahkan",
+            "Klik 'Login profil' untuk login Google pada profil baru, lalu klik 'URL project' "
+            "dan tempel URL project Flow milik akun tersebut.",
+        )
+
+    def refresh_project_label(self) -> None:
+        url = self.project_urls.get(self.profile_var.get())
+        if url:
+            project_id = url.rstrip("/").rsplit("/", 1)[-1]
+            self.project_var.set(f"Project: …{project_id[-12:]}")
+        else:
+            self.project_var.set("Project: BELUM DIATUR")
+
+    def set_project_url(self, name: str | None = None) -> bool:
+        """Minta URL project Flow milik akun profil lalu simpan."""
+        name = name or self.profile_var.get()
+        value = simpledialog.askstring(
+            "URL project Google Flow",
+            f"Profil: {name}\n\n"
+            "1. Klik 'Login profil', buka Google Flow dengan akun profil ini.\n"
+            "2. Buka project yang berisi karakter referensinya.\n"
+            "3. Salin URL dari address bar lalu tempel di sini.\n\n"
+            "Contoh: https://labs.google/fx/id/tools/flow/project/xxxxxxxx-xxxx-...",
+            initialvalue=self.project_urls.get(name, ""),
+            parent=self,
+        )
+        if value is None:
+            return False
+        match = PROJECT_URL_PATTERN.match(value.strip())
+        if not match:
+            messagebox.showerror(
+                "URL tidak valid",
+                "URL harus berupa alamat project Flow, contoh:\n"
+                "https://labs.google/fx/id/tools/flow/project/xxxxxxxx-...",
+            )
+            return False
+        self.project_urls[name] = match.group(0)
+        PROJECT_URLS_FILE.write_text(json.dumps(self.project_urls, indent=2), encoding="utf-8")
+        self.refresh_project_label()
+        return True
+
+    def ensure_url(self, name: str) -> str | None:
+        url = self.project_urls.get(name)
+        if url:
+            return url
+        messagebox.showinfo(
+            "URL project belum diatur",
+            f"Profil '{name}' belum punya URL project Flow. "
+            "Setiap akun Google punya project sendiri, jadi URL-nya harus diatur per profil.",
+        )
+        if not self.set_project_url(name):
+            return None
+        return self.project_urls.get(name)
+
+    def profile_path(self, name: str | None = None) -> Path:
+        path = Path(self.profiles[name or self.profile_var.get()])
+        return path if path.is_absolute() else APP_DIR / path
+
+    def login_profile(self) -> None:
+        candidates = [
+            Path(os.environ.get("PROGRAMFILES", "")) / "Google/Chrome/Application/chrome.exe",
+            Path(os.environ.get("PROGRAMFILES(X86)", "")) / "Google/Chrome/Application/chrome.exe",
+            Path(os.environ.get("LOCALAPPDATA", "")) / "Google/Chrome/Application/chrome.exe",
+        ]
+        chrome = next((path for path in candidates if path.is_file()), None)
+        if chrome is None:
+            messagebox.showerror("Chrome tidak ditemukan", "Instal Google Chrome biasa terlebih dahulu.")
+            return
+        profile = self.profile_path()
+        profile.mkdir(parents=True, exist_ok=True)
+        subprocess.Popen([str(chrome), f"--user-data-dir={profile}", "--no-first-run", "https://labs.google/fx/tools/flow"])
+        messagebox.showinfo("Login profil", "Login di Chrome yang terbuka, lalu tutup seluruh jendela profil tersebut sebelum menjalankan bot.")
+
+    # ---------------------------------------------------------- generate
+    def load_data_files(self) -> None:
+        """Muat otomatis semua Excel/CSV dari folder data saat aplikasi dibuka."""
+        data_dir = APP_DIR / "data"
+        if not data_dir.is_dir():
+            return
+        supported = {".xlsx", ".xlsm", ".csv"}
+        self.files = sorted(
+            (path for path in data_dir.iterdir()
+             if path.is_file() and path.suffix.casefold() in supported and not path.name.startswith("~$")),
+            key=lambda path: path.name.casefold(),
+        )
+        self.refresh_files()
+
+    def add_files(self) -> None:
+        selected = filedialog.askopenfilenames(
+            title="Pilih satu atau beberapa Excel/CSV",
+            filetypes=[("Excel dan CSV", "*.xlsx *.xlsm *.csv"), ("Semua file", "*.*")],
+        )
+        for value in selected:
+            path = Path(value)
+            if path not in self.files:
+                self.files.append(path)
+        self.refresh_files()
+
+    def remove_files(self) -> None:
+        selected = set(self.file_list.curselection())
+        self.files = [path for index, path in enumerate(self.files) if index not in selected]
+        self.refresh_files()
+
+    def move_file(self, direction: int) -> None:
+        selected = self.file_list.curselection()
+        if len(selected) != 1:
+            return
+        old = selected[0]
+        new = max(0, min(len(self.files) - 1, old + direction))
+        if old == new:
+            return
+        self.files[old], self.files[new] = self.files[new], self.files[old]
+        self.refresh_files()
+        self.file_list.selection_set(new)
+
+    def refresh_files(self) -> None:
+        self.file_list.delete(0, "end")
+        total = 0
+        config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        for index, path in enumerate(self.files, start=1):
+            try:
+                count = len(bot.prompt_rows(path, config))
+                total += count
+                self.file_list.insert("end", f"{index}. {path.name} — {count} prompt belum selesai")
+            except Exception as exc:
+                self.file_list.insert("end", f"{index}. {path.name} — ERROR: {exc}")
+        self.summary_var.set(f"{len(self.files)} file • total {total} prompt belum selesai (baris bertanda SELESAI/SEBAGIAN/DITOLAK dilewati)")
+
+    def append_log(self, value: str) -> None:
+        self.log.configure(state="normal")
+        self.log.insert("end", value)
+        # Batasi panel Progres agar aplikasi tetap ringan (log lengkap ada di runtime/logs/bot.log).
+        lines = int(self.log.index("end-1c").split(".")[0])
+        if lines > 4000:
+            self.log.delete("1.0", f"{lines - 3000}.0")
+        self.log.see("end")
+        self.log.configure(state="disabled")
+        if any(key in value for key in ("PROGRES ", "FILE ", "KARAKTER ", "CEK KARAKTER")):
+            self.status_var.set(value.split("| INFO |")[-1].strip()[:140])
+
+    def run_worker(self, job: str, args: list[str], status: str) -> None:
+        reload_modules()
+        self.job = job
+        self.set_busy(True)
+        self.status_var.set(status)
+        self.append_log(f"\n=== {status} ===\n")
+        env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
+        try:
+            self.process = subprocess.Popen(
+                worker_command(args), cwd=APP_DIR, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace", bufsize=1, env=env,
+            )
+        except Exception as exc:
+            self.process = None
+            self.job = ""
+            self.set_busy(False)
+            self.status_var.set("Gagal menjalankan bot")
+            self.append_log(f"ERROR: bot tidak bisa dijalankan: {exc}\n")
+            messagebox.showerror("Gagal", f"Bot tidak bisa dijalankan:\n{exc}")
+            return
+        self.job_done = set()
+        threading.Thread(target=self._read_process, args=(self.process,), daemon=True).start()
+
+    def start(self) -> None:
+        if self.process is not None or self.pending_launch is not None or self.job:
+            return
+        if not self.files:
+            messagebox.showwarning("Belum ada file", "Pilih minimal satu Excel atau CSV.")
+            return
+        reload_modules()
+        config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        try:
+            total_prompts = sum(len(bot.prompt_rows(path, config)) for path in self.files)
+        except Exception as exc:
+            messagebox.showerror("Excel tidak dapat dibaca", str(exc))
+            return
+        if total_prompts == 0:
+            messagebox.showwarning(
+                "Tidak ada prompt",
+                "Tidak ada prompt yang perlu dikerjakan. Semua baris sudah bertanda SELESAI/SEBAGIAN/DITOLAK di kolom STATUS, "
+                "atau kolom Prompt kosong. Kosongkan sel STATUS untuk mengulang scene tertentu.",
+            )
+            return
+        name = self.profile_var.get()
+        url = self.ensure_url(name)
+        if not url:
+            return
+        self.save_rotation()
+        self.rotation = [name]
+        if self.rotate_var.get():
+            picked = {self.rotation_list.get(i) for i in self.rotation_list.curselection()}
+            order = []
+            for other in self.profiles:  # urutan daftar profil
+                if other != name and other not in picked:
+                    continue
+                if other != name and not self.project_urls.get(other):
+                    self.append_log(f"INFO: profil '{other}' dilewati dari rotasi (URL project belum diatur)\n")
+                    continue
+                order.append(other)
+            # Mulai dari profil sekarang, lanjut ke bawah, lalu memutar ke atas: tiap profil sekali.
+            start_at = order.index(name)
+            self.rotation = order[start_at:] + order[:start_at]
+            if len(self.rotation) > 1:
+                self.append_log("ROTASI PROFIL: " + " → ".join(self.rotation) + "\n")
+            else:
+                self.append_log("INFO: Pindah profil otomatis aktif, tetapi belum ada profil lain yang dipilih/punya URL.\n")
+        self.rotation_index = 0
+        self.launch_generate()
+
+    def launch_generate(self) -> None:
+        self.pending_launch = None
+        if self.rotation_index >= len(self.rotation):
+            # Dibatalkan lewat tombol Hentikan saat jeda pindah profil.
+            self.job = ""
+            self.set_busy(False)
+            self.status_var.set("Dihentikan")
+            return
+        name = self.rotation[self.rotation_index]
+        url = self.project_urls[name]
+        self.job_info = {"profile": name}
+        self.profile_var.set(name)
+        self.refresh_project_label()
+        self.save_rotation(last_profile=name)
+        args = ["--profile-dir", str(self.profile_path(name)), "--url", url, "--profile-name", name,
+                "--inputs", *[str(path) for path in self.files]]
+        step = f" ({self.rotation_index + 1}/{len(self.rotation)})" if len(self.rotation) > 1 else ""
+        self.run_worker("generate", args, f"Generate gambar | profil {name}{step}")
+
+    def _read_process(self, process: subprocess.Popen) -> None:
+        """Thread pembaca: hanya menaruh ke antrean; UI diperbarui di thread Tk."""
+        assert process.stdout is not None
+        for line in process.stdout:
+            self.output.put(("line", line))
+        self.output.put(("exit", process.wait()))
+
+    def _poll_output(self) -> None:
+        try:
+            for _ in range(400):
+                kind, value = self.output.get_nowait()
+                if kind == "line":
+                    self.append_log(value)
+                    if self.job == "clean":
+                        found = re.search(
+                            r"(?:BERSIH SELESAI \||CEK SELESAI \||karakter tanpa nama ke-)\s*(\d+)", value
+                        )
+                        if found:
+                            self.job_info["cleaned"] = found.group(1)
+                    if self.job == "transfer":
+                        for name in self.job_picked:
+                            if re.search(rf"\| {re.escape(name)} (berhasil dibuat|sudah ada di profil tujuan)", value):
+                                self.job_done.add(name)
+                else:
+                    self._finished(int(value))
+        except queue.Empty:
+            pass
+        finally:
+            self.after(100, self._poll_output)
+
+    def _finished(self, code: int) -> None:
+        self.process = None
+        job, self.job = self.job, ""
+        if job == "compare":
+            self.set_busy(False)
+            self._compare_finished(code)
+            return
+        if job == "transfer":
+            self.set_busy(False)
+            self._transfer_finished(code)
+            return
+        if job == "clean":
+            self.set_busy(False)
+            count = self.job_info.get("cleaned", "0")
+            profile = self.job_info.get("profile", "")
+            if self.job_info.get("preview") and code != 6:
+                self.status_var.set(f"Cek: {count} karakter tanpa nama di {profile}")
+                messagebox.showinfo(
+                    "Cek selesai",
+                    f"Ditemukan {count} karakter tanpa nama di profil '{profile}'. Tidak ada yang dihapus.\n"
+                    "Untuk menghapusnya, klik tombol ini lagi lalu pilih YES."
+                    + ("" if code == 0 else "\nSebagian kartu belum bisa dicek; lihat panel Progres."),
+                )
+            elif code == 0:
+                self.status_var.set(f"{count} karakter tanpa nama dihapus di {profile}")
+                messagebox.showinfo("Selesai", f"{count} karakter tanpa nama dihapus di profil '{profile}'.")
+            elif code == 6:
+                self._project_not_found(profile)
+            else:
+                self.status_var.set(f"{count} karakter tanpa nama dihapus di {profile} (belum semua)")
+                messagebox.showwarning(
+                    "Belum selesai",
+                    f"{count} karakter tanpa nama dihapus di profil '{profile}', tetapi sebagian belum terhapus "
+                    "atau menu Karakter tidak terbuka. Klik tombol ini sekali lagi; detail ada di panel Progres.",
+                )
+            return
+        self.set_busy(False)
+        try:
+            self.refresh_files()
+        except Exception as exc:
+            self.append_log(f"INFO: daftar Excel belum bisa dimuat ulang: {exc}\n")
+        profile = self.job_info.get("profile", self.profile_var.get())
+        if code in (6, 9, 10) and self.rotation_index + 1 < len(self.rotation):
+            self.rotation_index += 1
+            nxt = self.rotation[self.rotation_index]
+            reason = {9: "berhenti karena kredit habis", 10: "berhenti karena pembatasan ('aktivitas tidak biasa')",
+                      6: "project Flow tidak ditemukan"}[code]
+            self.append_log(f"\n=== PINDAH PROFIL OTOMATIS | {profile} {reason} → lanjut dengan profil {nxt} ===\n")
+            self.status_var.set(f"Pindah ke profil {nxt}...")
+            self.set_busy(True)
+            self.job = "generate"  # tahan tombol sampai profil berikutnya berjalan
+            self.pending_launch = self.after(3000, self.launch_generate)
+            return
+        self.status_var.set("Semua selesai" if code == 0 else f"Berhenti dengan kode {code}")
+        if code == 0:
+            messagebox.showinfo("Selesai", "Semua file yang dipilih sudah diproses.")
+        elif code == 5:
+            messagebox.showerror(
+                "Pergantian model gagal",
+                "Bot berhenti karena reload/pergantian model (Nano Banana 2 -> Lite) gagal. "
+                "Lihat panel Progres, lalu klik Mulai lagi untuk melanjutkan.",
+            )
+        elif code == 6:
+            self._project_not_found(profile)
+        elif code in (9, 10):
+            many = len(self.rotation) > 1
+            reason = ("kredit habis/kena pembatasan" if many
+                      else "kredit habis" if code == 9 else "kena pembatasan ('aktivitas tidak biasa')")
+            messagebox.showwarning(
+                "Bot dihentikan",
+                (f"Semua profil ({', '.join(self.rotation)}) {reason} di Nano Banana 2 dan Lite. " if many
+                 else f"Profil '{profile}' {reason} di Nano Banana 2 dan Lite. ")
+                + "Bot dihentikan. Klik Mulai lagi nanti: bot mulai dari profil terakhir "
+                f"('{profile}') dan melanjutkan dari scene terakhir.",
+            )
+        else:
+            messagebox.showerror("Bot berhenti", "Lihat panel Progres untuk detail kesalahan.")
+
+    def _project_not_found(self, profile: str) -> None:
+        messagebox.showerror(
+            "Project Flow tidak ditemukan",
+            f"Akun Google di profil '{profile}' tidak dapat membuka project:\n"
+            f"{self.project_urls.get(profile, '-')}\n\n"
+            "Pilih profil itu di atas, klik 'URL project' lalu tempel URL project Flow milik akun tersebut.",
+        )
+
+    def make_capcut(self) -> None:
+        """Buat sheet "Urutan CapCut" dari Excel terpilih + Word narasi + SRT."""
+        if self.process is not None:
+            messagebox.showwarning("Bot sedang berjalan", "Tunggu bot selesai atau hentikan dulu.")
+            return
+        reload_modules()
+        selected = self.file_list.curselection()
+        if len(selected) == 1:
+            excel = self.files[selected[0]]
+        elif len(self.files) == 1:
+            excel = self.files[0]
+        else:
+            messagebox.showinfo("Pilih Excel", "Klik satu Excel di daftar, lalu tekan 'Buat Urutan CapCut'.")
+            return
+        if excel.suffix.casefold() not in {".xlsx", ".xlsm"}:
+            messagebox.showwarning("Format tidak didukung", "Urutan CapCut hanya dapat dibuat dari .xlsx.")
+            return
+        srt = capcut_plan.find_srt(excel)
+        if srt is None:
+            value = filedialog.askopenfilename(
+                title=f"Pilih SRT dubbing untuk {excel.name}",
+                initialdir=str(excel.parent), filetypes=[("Subtitle SRT", "*.srt")],
+            )
+            if not value:
+                return
+            srt = Path(value)
+        docx = bot.find_narration_docx(excel)
+        if docx is None:
+            value = filedialog.askopenfilename(
+                title=f"Pilih Word narasi untuk {excel.name}",
+                initialdir=str(excel.parent), filetypes=[("Word", "*.docx")],
+            )
+            if not value:
+                return
+            docx = Path(value)
+        config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        try:
+            result = capcut_plan.make_plan(excel, config, srt, docx)
+        except Exception as exc:
+            messagebox.showerror("Urutan CapCut gagal", str(exc))
+            return
+        summary = capcut_plan.summary_text(result)
+        self.append_log("\n=== URUTAN CAPCUT | " + excel.name + " ===\n" + summary + "\n")
+        if result["output"] is None:
+            messagebox.showwarning("Urutan CapCut", summary)
+        else:
+            messagebox.showinfo(
+                "Urutan CapCut selesai",
+                f"Sheet '{capcut_plan.SHEET_NAME}' dibuat di {result['output'].name}.\n"
+                f"{len(result['clips'])} gambar, total {capcut_plan.fmt(result['total'])}.\n\n"
+                "File CapCut ada di folder gambar episode ini. Detail ada di panel Progres.",
+            )
+
+    def stop(self) -> None:
+        self.rotation_index = len(self.rotation)  # batalkan pindah profil berikutnya
+        if self.pending_launch is not None:
+            self.after_cancel(self.pending_launch)
+            self.pending_launch = None
+        if self.process is None and self.job == "generate":
+            self.launch_generate()  # indeks sudah di luar rotasi -> hanya membereskan tombol
+            return
+        if self.process is not None:
+            self.process.terminate()
+            self.status_var.set("Menghentikan...")
+
+    # -------------------------------------------------------- characters
+    def swap_profiles(self) -> None:
+        source, target = self.source_var.get(), self.target_var.get()
+        self.source_var.set(target)
+        self.target_var.set(source)
+        self.load_last_compare()
+
+    def character_dir(self, source: str) -> Path:
+        return CHARACTER_ROOT / safe_name(source)
+
+    def compare_file(self, source: str, target: str) -> Path:
+        return self.character_dir(source) / f"_banding_{safe_name(target)}.json"
+
+    def show_compare(self, missing: list[str], existing: list[str]) -> None:
+        self.missing = list(missing)
+        self.missing_list.delete(0, "end")
+        self.existing_list.delete(0, "end")
+        for name in missing:
+            self.missing_list.insert("end", name)
+        for name in existing:
+            self.existing_list.insert("end", name)
+        self.select_all_missing()
+        idle = self.process is None and not self.job and self.pending_launch is None
+        self.transfer_button.configure(state="normal" if missing and idle else "disabled")
+
+    def load_last_compare(self) -> None:
+        source, target = self.source_var.get(), self.target_var.get()
+        path = self.compare_file(source, target)
+        data = None
+        if path.is_file():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                data = None
+        if not data:
+            self.show_compare([], [])
+            self.char_info_var.set(f"{source} → {target}: belum dicek. Klik '1. Cek karakter'.")
+            return
+        # Buang yang sudah berhasil dipindah sebelumnya.
+        moved = {n.casefold() for n in data.get("moved", [])}
+        missing = [n for n in data.get("missing", []) if n.casefold() not in moved]
+        existing = data.get("existing", []) + [n for n in data.get("missing", []) if n.casefold() in moved]
+        self.show_compare(missing, existing)
+        self.char_info_var.set(
+            f"{source} → {target}: hasil cek {data.get('checked_at', '-')} • belum ada {len(missing)}, "
+            f"sudah ada {len(existing)}. Klik '1. Cek karakter' untuk cek ulang."
+        )
+
+    def select_all_missing(self) -> None:
+        if self.missing_list.size():
+            self.missing_list.selection_set(0, "end")
+
+    def open_character_folder(self) -> None:
+        self.open_folder(self.character_dir(self.source_var.get()))
+
+    def clean_untitled(self) -> None:
+        """Hapus karakter 'Karakter tanpa judul' (tanpa nama) di profil yang dipilih di atas."""
+        if self.process is not None or self.job or self.pending_launch is not None:
+            return
+        name = self.profile_var.get()
+        url = self.ensure_url(name)
+        if not url:
+            return
+        answer = messagebox.askyesnocancel(
+            "Hapus karakter tanpa nama",
+            f"Profil '{name}': bot membuka Flow lalu memeriksa SEMUA karakter tanpa nama "
+            "('Karakter tanpa judul'), sisa kegagalan bot.\n\n"
+            "Karakter yang punya nama TIDAK disentuh (dicek satu per satu sebelum dihapus).\n\n"
+            "YES = hapus karakter tanpa nama\n"
+            "NO = cek saja (hanya dihitung, tidak ada yang dihapus)\n"
+            "CANCEL = batal\n\n"
+            f"Tutup dulu Chrome profil '{name}'.",
+        )
+        if answer is None:
+            return
+        preview = answer is False
+        self.job_info = {"profile": name, "cleaned": "0", "preview": preview}
+        args = ["--profile-dir", str(self.profile_path(name)), "--url", url, "--profile-name", name, "--clean-untitled"]
+        if preview:
+            args.append("--check-only")
+        title = "Cek karakter tanpa nama" if preview else "Hapus karakter tanpa nama"
+        self.run_worker("clean", args, f"{title} | profil {name}")
+
+    def _pair(self) -> tuple[str, str, str, str] | None:
+        source, target = self.source_var.get(), self.target_var.get()
+        if source == target:
+            messagebox.showwarning("Profil sama", "Profil sumber dan tujuan harus berbeda (misal A → B).")
+            return None
+        source_url = self.ensure_url(source)
+        if not source_url:
+            return None
+        target_url = self.ensure_url(target)
+        if not target_url:
+            return None
+        return source, target, source_url, target_url
+
+    def compare_characters(self) -> None:
+        if self.process is not None or self.job or self.pending_launch is not None:
+            return
+        pair = self._pair()
+        if pair is None:
+            return
+        source, target, source_url, target_url = pair
+        if not messagebox.askokcancel(
+            "Cek karakter",
+            f"Bot akan membuka Flow profil '{target}' lalu '{source}' untuk membandingkan karakter, "
+            f"dan mengunduh gambar karakter yang belum ada di '{target}'.\n\n"
+            "Tutup dulu semua jendela Chrome kedua profil ini. Lanjut?",
+        ):
+            return
+        self.show_compare([], [])
+        self.char_info_var.set(f"Mengecek {source} → {target}...")
+        self.job_info = {"source": source, "target": target}
+        args = ["--profile-dir", str(self.profile_path(source)), "--url", source_url,
+                "--profile-name", source, "--compare-characters",
+                "--target-profile-dir", str(self.profile_path(target)), "--target-url", target_url,
+                "--target-name", target]
+        self.run_worker("compare", args, f"Cek karakter {source} → {target}")
+
+    def _compare_finished(self, code: int) -> None:
+        source, target = self.job_info.get("source", ""), self.job_info.get("target", "")
+        if code == 6:
+            self.status_var.set("Project tidak ditemukan")
+            messagebox.showerror("Project Flow tidak ditemukan",
+                                 f"Salah satu profil ({source} / {target}) tidak bisa membuka project-nya. "
+                                 "Periksa 'URL project' kedua profil. Detail di panel Progres.")
+            return
+        if code != 0:
+            self.status_var.set(f"Cek karakter gagal (kode {code})")
+            messagebox.showerror("Cek karakter gagal", "Lihat panel Progres untuk detail.")
+            return
+        self.source_var.set(source)
+        self.target_var.set(target)
+        self.load_last_compare()
+        self.status_var.set(f"Cek selesai: {len(self.missing)} karakter belum ada di {target}")
+        if not self.missing and not self.existing_list.size():
+            messagebox.showwarning(
+                "Cek karakter",
+                f"Tidak ada karakter yang terbaca di profil '{source}'. Pastikan project-nya berisi karakter "
+                "(menu Karakter/Characters di Flow). Detail di panel Progres.",
+            )
+        elif not self.missing:
+            messagebox.showinfo("Cek karakter", f"Semua karakter {source} sudah ada di {target}. Tidak ada yang perlu dipindah.")
+        else:
+            messagebox.showinfo(
+                "Cek karakter",
+                f"{len(self.missing)} karakter {source} belum ada di {target}.\n"
+                "Pilih karakter di daftar kiri lalu klik '2. Pindahkan yang dipilih'.",
+            )
+
+    def transfer_characters(self) -> None:
+        if self.process is not None or self.job or self.pending_launch is not None:
+            return
+        picked = [self.missing_list.get(i) for i in self.missing_list.curselection()]
+        if not picked:
+            messagebox.showinfo("Pilih karakter", "Pilih minimal satu karakter di daftar 'BELUM ADA'.")
+            return
+        source, target = self.source_var.get(), self.target_var.get()
+        if source == target:
+            messagebox.showwarning("Profil sama", "Profil sumber dan tujuan harus berbeda.")
+            return
+        target_url = self.ensure_url(target)
+        if not target_url:
+            return
+        folder = self.character_dir(source)
+        if not (folder / "karakter.json").is_file():
+            messagebox.showwarning("Belum dicek", "Klik '1. Cek karakter' dulu agar gambar karakter diunduh.")
+            return
+        if not messagebox.askokcancel(
+            "Pindahkan karakter",
+            f"Buat {len(picked)} karakter di profil '{target}':\n\n" + "\n".join(f"• {n}" for n in picked[:20])
+            + ("\n…" if len(picked) > 20 else "") + f"\n\nTutup dulu Chrome profil '{target}'. Lanjut?",
+        ):
+            return
+        self.job_info = {"source": source, "target": target, "names": json.dumps(picked)}
+        names_file = APP_DIR / "runtime" / "pindah_karakter.json"
+        names_file.parent.mkdir(parents=True, exist_ok=True)
+        names_file.write_text(json.dumps(picked, ensure_ascii=False), encoding="utf-8")
+        self.job_picked = list(picked)
+        args = ["--profile-dir", str(self.profile_path(target)), "--url", target_url,
+                "--profile-name", target, "--import-characters", "--character-folder", str(folder),
+                "--names-file", str(names_file)]
+        self.run_worker("transfer", args, f"Pindah {len(picked)} karakter {source} → {target}")
+
+    def _transfer_finished(self, code: int) -> None:
+        source, target = self.job_info.get("source", ""), self.job_info.get("target", "")
+        picked = json.loads(self.job_info.get("names", "[]"))
+        # Dihitung dari keluaran proses pindah yang barusan, baris demi baris.
+        done = [n for n in picked if n in self.job_done]
+        path = self.compare_file(source, target)
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            data["moved"] = sorted({*data.get("moved", []), *done}, key=str.casefold)
+            path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        except (OSError, ValueError):
+            pass
+        self.load_last_compare()
+        if code == 6:
+            self._project_not_found(target)
+        elif code == 0:
+            self.status_var.set(f"Pindah karakter selesai: {len(done)} karakter di {target}")
+            messagebox.showinfo("Pindah karakter selesai", f"{len(done)} karakter sekarang ada di profil '{target}'.")
+        else:
+            failed = [n for n in picked if n not in done]
+            self.status_var.set(f"Pindah karakter: {len(failed)} gagal")
+            messagebox.showwarning(
+                "Sebagian gagal",
+                f"Berhasil: {len(done)}\nGagal: {', '.join(failed) or '-'}\n\nLihat panel Progres, lalu coba pindahkan lagi.",
+            )
+
+
+if __name__ == "__main__":
+    if "--worker" in sys.argv:
+        sys.argv.remove("--worker")
+        raise SystemExit(bot.main())
+    FlowBotApp().mainloop()

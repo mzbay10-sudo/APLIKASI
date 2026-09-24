@@ -1,0 +1,119 @@
+{
+  "url": "https://labs.google/fx/tools/flow",
+  "headless": false,
+  "browser_channel": "chrome",
+  "slow_mo_ms": 80,
+  "timeout_ms": 30000,
+  "ready_timeout_ms": 120000,
+  "model_schedule": {
+    "enabled": true,
+    "primary_model": "Nano Banana 2",
+    "primary_generate_count": 100,
+    "fallback_model": "Nano Banana 2 Lite",
+    "selection_timeout_ms": 30000,
+    "reload_ready_timeout_ms": 600000,
+    "reload_attempts": 3,
+    "ready_stable_checks": 3,
+    "ready_poll_interval_ms": 1000
+  },
+  "profile_dir": "runtime/browser-profile",
+  "input_file": "data/input.xlsx",
+  "sheet_name": null,
+  "start_row": 2,
+  "stop_on_error": false,
+  "after_generate_wait_ms": 10000,
+  "fields": {
+    "Character 1": {
+      "column": "2"
+    },
+    "Character 2": {
+      "column": "3"
+    },
+    "Character 3": {
+      "column": "4"
+    },
+    "Character 4": {
+      "column": "5"
+    },
+    "Character 5": {
+      "column": "6"
+    },
+    "Character 6": {
+      "column": "7"
+    },
+    "Character 7": {
+      "column": "8"
+    },
+    "Character 8": {
+      "column": "9"
+    },
+    "Character 9": {
+      "column": "10"
+    },
+    "Character 10": {
+      "column": "11"
+    }
+  },
+  "prompt": {
+    "column": "1",
+    "bundle_timeout_ms": 20000,
+    "stable_checks": 5,
+    "action_click_retry_count": 4,
+    "action_click_timeout_ms": 2500,
+    "selectors": [
+      "textarea[placeholder*='Apa yang ingin']",
+      "textarea[placeholder*='What do you want']",
+      "[role='textbox'][contenteditable='true']",
+      "[contenteditable='true']"
+    ],
+    "left_action_selectors": [
+      "button[aria-label='Add']",
+      "button[aria-label*='Tambah' i]",
+      "button[aria-label*='Add media' i]",
+      "button[aria-label*='Media' i]",
+      "button[title*='Tambah' i]",
+      "button[title*='Add' i]",
+      "button:has(.material-symbols-outlined:text-is('add'))",
+      "button:has(.material-symbols-rounded:text-is('add'))"
+    ],
+    "right_action_selectors": [
+      "button[aria-label*='Generate' i]",
+      "button[aria-label*='Buat' i]",
+      "button[aria-label*='Kirim' i]",
+      "button:has(.material-symbols-outlined:text-is('arrow_forward'))",
+      "button:has(.material-symbols-rounded:text-is('arrow_forward'))"
+    ]
+  },
+  "asset_picker": {
+    "character_category_texts": [
+      "Karakter",
+      "Character"
+    ],
+    "search_selectors": [
+      "input[placeholder*='Telusuri aset']",
+      "input[placeholder*='Search assets']"
+    ],
+    "add_selectors": [
+      "button:has-text('Tambahkan ke Perintah')",
+      "button:has-text('Add to prompt')"
+    ],
+    "open_retry_count": 3,
+    "open_retry_timeout_ms": 12000,
+    "search_wait_ms": 700,
+    "attach_timeout_ms": 15000
+  },
+  "generate_selectors": [
+    "button[aria-label*='Generate' i]",
+    "button[aria-label*='Buat' i]",
+    "button[aria-label*='Kirim' i]"
+  ],
+  "download": {
+    "root_folder": "downloads",
+    "folder": "downloads/RG_848-850",
+    "base_name": "RG_848-850",
+    "outputs_per_row": 2,
+    "generation_timeout_ms": 300000,
+    "no_activity_timeout_ms": 30000,
+    "top_row_max_y": 250
+  }
+}
