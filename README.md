@@ -106,14 +106,9 @@ Untuk setiap baris, bot hanya menekan Create satu kali dan mengunduh semua hasil
 
 Kartu aset dengan ikon orang di pojok kiri atas dikenali sebagai **Karakter** dan selalu dilindungi: tidak dianggap sebagai hasil generate, tidak diunduh, dan tidak dihapus. Panel progres mencatat `KARAKTER DILINDUNGI` atau `HASIL GENERATE` untuk memudahkan audit.
 
-## Pindah Karakter antar Profil (tab kedua aplikasi)
+## Karakter antar profil (otomatis, tanpa tab terpisah)
 
-1. Pilih **Dari profil (A)** dan **Ke profil (B)**, misalnya Renegade Immortal → BTS atau A → C. Tombol **Tukar** membalik arah.
-2. Klik **1. Cek karakter**. Bot membuka Flow profil tujuan lalu profil sumber, lalu membandingkan nama karakternya.
-   - **BELUM ADA di tujuan**: hanya karakter ini yang gambarnya diunduh ke `downloads\_KARAKTER\<nama profil sumber>\` (plus `karakter.json`).
-   - **SUDAH ADA di tujuan**: dilewati dan tidak dipindah.
-3. Pilih karakter di daftar kiri (Shift/Ctrl untuk beberapa, atau **Pilih semua**), lalu klik **2. Pindahkan yang dipilih**. Bot membuat karakter baru di profil tujuan dengan gambar dan nama yang sama.
-4. Tutup semua jendela Chrome kedua profil sebelum menekan tombol.
+Aplikasi hanya punya satu layar: **Generate Gambar**. Tab **Pindah Karakter antar Profil** sudah dihapus karena tidak diperlukan lagi. Cukup pilih Excel lalu klik **Mulai generate**. Karakter yang dipakai Excel tetapi belum ada di profil yang sedang dipakai otomatis dicari di profil lain lalu dibuat di profil ini sebelum generate dimulai (lihat **Sinkron karakter otomatis sebelum generate** di bawah).
 
 Flow berbahasa Inggris maupun Indonesia sama-sama didukung.
 
@@ -172,4 +167,4 @@ Kalau upload gambar ditolak Flow atau nama gagal tersimpan, bot sekarang:
 1. Mengisi ulang nama (10 cara cadangan) lalu membuka ulang halaman karakter untuk memastikan nama benar-benar tersimpan.
 2. Kalau tetap gagal, bot menghapus **hanya draf yang barusan dibuatnya sendiri**, dan hanya kalau judulnya masih kosong. Karakter yang punya nama tidak pernah dihapus.
 
-Untuk membersihkan sisa karakter tanpa nama dari kegagalan sebelumnya, buka tab **Pindah Karakter**, pilih profil di **Profil** (atas), lalu klik **Hapus karakter tanpa nama**. Pilih **YES** untuk menghapus, atau **NO** untuk cek saja (hanya dihitung, tidak ada yang dihapus). Bot mengecek label dan gambar kartu (supaya kartu tidak tertukar), membuka setiap kartu tanpa nama, menunggu halamannya termuat, dan membaca namanya 2 kali. Karakter hanya dihapus kalau judulnya memang kosong. Kalau namanya tidak terbaca dengan pasti, karakter itu dilewati.
+Untuk membersihkan sisa karakter tanpa nama dari kegagalan sebelumnya, pilih profil di **Profil** (atas), lalu klik **Hapus karakter tanpa nama** (kanan bawah bagian Generate Gambar). Pilih **YES** untuk menghapus, atau **NO** untuk cek saja (hanya dihitung, tidak ada yang dihapus). Bot mengecek label dan gambar kartu (supaya kartu tidak tertukar), membuka setiap kartu tanpa nama, menunggu halamannya termuat, dan membaca namanya 2 kali. Karakter hanya dihapus kalau judulnya memang kosong. Kalau namanya tidak terbaca dengan pasti, karakter itu dilewati.

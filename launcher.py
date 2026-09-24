@@ -130,18 +130,10 @@ def worker_command(extra: list[str]) -> list[str]:
 
 
 
-
-CHARACTER_ROOT = APP_DIR / "downloads" / "_KARAKTER"
-
-
-def safe_name(value: str) -> str:
-    return re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", str(value)).strip(" .") or "karakter"
-
-
 class FlowBotApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("Flow Bot v8 - Generate Gambar & Pindah Karakter")
+        self.title("Flow Bot v8 - Generate Gambar")
         self.geometry("980x720")
         self.minsize(860, 620)
         self.profiles = load_profiles()
@@ -156,23 +148,16 @@ class FlowBotApp(tk.Tk):
             PROFILES_FILE.write_text(json.dumps(self.profiles, indent=2), encoding="utf-8")
         names = list(self.profiles)
         self.profile_var = tk.StringVar(value=names[0])
-        self.source_var = tk.StringVar(value=names[0])
-        self.target_var = tk.StringVar(value=names[1] if len(names) > 1 else names[0])
         self.summary_var = tk.StringVar(value="Belum ada Excel dipilih")
         self.status_var = tk.StringVar(value="Siap")
-        self.char_info_var = tk.StringVar(value="Pilih profil sumber dan tujuan, lalu klik '1. Cek karakter'.")
-        self.missing: list[str] = []
         self.rotate_var = tk.BooleanVar(value=False)
         self.rotation: list[str] = []
         self.rotation_index = 0
         self.pending_launch: str | None = None
-        self.job_done: set[str] = set()
-        self.job_picked: list[str] = []
         self.output: queue.Queue = queue.Queue()
         self.after(100, self._poll_output)
         self._build()
         self.load_data_files()
-        self.load_last_compare()
 
     # ------------------------------------------------------------------ UI
     def _build(self) -> None:
@@ -196,14 +181,9 @@ class FlowBotApp(tk.Tk):
         ttk.Label(profile_box, textvariable=self.project_var, foreground="#555").pack(side="left", padx=8)
         self.profile_combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh_project_label())
 
-        self.tabs = ttk.Notebook(outer)
-        self.tabs.pack(fill="x", pady=(10, 0))
-        gen = ttk.Frame(self.tabs, padding=10)
-        char = ttk.Frame(self.tabs, padding=10)
-        self.tabs.add(gen, text="  Generate Gambar  ")
-        self.tabs.add(char, text="  Pindah Karakter antar Profil  ")
+        gen = ttk.LabelFrame(outer, text="Generate Gambar", padding=10)
+        gen.pack(fill="x", pady=(10, 0))
         self._build_generate(gen)
-        self._build_characters(char)
 
         bottom = ttk.Frame(outer)
         bottom.pack(fill="x", pady=(8, 0))
@@ -221,7 +201,11 @@ class FlowBotApp(tk.Tk):
         self.refresh_profile_lists()
 
     def _build_generate(self, parent: ttk.Frame) -> None:
-        ttk.Label(parent, text="Generate memakai profil yang dipilih di atas.", foreground="#555").pack(anchor="w")
+        ttk.Label(
+            parent, foreground="#555", wraplength=900, justify="left",
+            text="Generate memakai profil yang dipilih di atas. Karakter di Excel yang belum ada di profil ini "
+                 "otomatis dicari di profil lain lalu dipindahkan sebelum generate (tutup Chrome profil lain).",
+        ).pack(anchor="w")
         buttons = ttk.Frame(parent)
         buttons.pack(fill="x", pady=(6, 0))
         ttk.Button(buttons, text="Tambah Excel", command=self.add_files).pack(side="left", padx=(0, 5))
@@ -252,52 +236,12 @@ class FlowBotApp(tk.Tk):
         self.capcut_button = ttk.Button(run_box, text="Buat Urutan CapCut", style="Big.TButton", command=self.make_capcut)
         self.capcut_button.pack(side="left", padx=8)
         ttk.Button(run_box, text="Buka folder hasil", command=lambda: self.open_folder(APP_DIR / "downloads")).pack(side="left")
-
-    def _build_characters(self, parent: ttk.Frame) -> None:
-        pick = ttk.Frame(parent)
-        pick.pack(fill="x")
-        ttk.Label(pick, text="Dari profil (A):", style="Head.TLabel").pack(side="left")
-        self.source_combo = ttk.Combobox(pick, textvariable=self.source_var, state="readonly", width=24)
-        self.source_combo.pack(side="left", padx=(4, 8))
-        ttk.Button(pick, text="Tukar", width=6, command=self.swap_profiles).pack(side="left")
-        ttk.Label(pick, text="Ke profil (B):", style="Head.TLabel").pack(side="left", padx=(8, 0))
-        self.target_combo = ttk.Combobox(pick, textvariable=self.target_var, state="readonly", width=24)
-        self.target_combo.pack(side="left", padx=4)
-        for combo in (self.source_combo, self.target_combo):
-            combo.bind("<<ComboboxSelected>>", lambda _event: self.load_last_compare())
-
-        steps = ttk.Frame(parent)
-        steps.pack(fill="x", pady=(8, 0))
-        self.compare_button = ttk.Button(steps, text="1. Cek karakter", style="Big.TButton", command=self.compare_characters)
-        self.compare_button.pack(side="left")
-        self.transfer_button = ttk.Button(steps, text="2. Pindahkan yang dipilih", style="Big.TButton",
-                                          command=self.transfer_characters, state="disabled")
-        self.transfer_button.pack(side="left", padx=8)
-        ttk.Button(steps, text="Pilih semua", command=self.select_all_missing).pack(side="left")
-        ttk.Button(steps, text="Buka folder karakter", command=self.open_character_folder).pack(side="left", padx=8)
-        self.clean_button = ttk.Button(
-            steps, text="Hapus karakter tanpa nama", command=self.clean_untitled
-        )
-        self.clean_button.pack(side="left")
-
-        lists = ttk.Frame(parent)
-        lists.pack(fill="x", pady=(8, 0))
-        left = ttk.Frame(lists)
-        left.pack(side="left", fill="both", expand=True, padx=(0, 6))
-        right = ttk.Frame(lists)
-        right.pack(side="left", fill="both", expand=True, padx=(6, 0))
-        ttk.Label(left, text="BELUM ADA di tujuan (akan dipindah):", style="Head.TLabel").pack(anchor="w")
-        self.missing_list = tk.Listbox(left, height=8, selectmode="extended", exportselection=False)
-        self.missing_list.pack(fill="both", expand=True)
-        ttk.Label(right, text="SUDAH ADA di tujuan (dilewati):", style="Head.TLabel").pack(anchor="w")
-        self.existing_list = tk.Listbox(right, height=8, foreground="#777", exportselection=False)
-        self.existing_list.pack(fill="both", expand=True)
-        ttk.Label(parent, textvariable=self.char_info_var, foreground="#555", wraplength=900).pack(anchor="w", pady=(6, 0))
+        self.clean_button = ttk.Button(run_box, text="Hapus karakter tanpa nama", command=self.clean_untitled)
+        self.clean_button.pack(side="right")
 
     def refresh_profile_lists(self) -> None:
         names = list(self.profiles)
-        for combo in (self.profile_combo, self.source_combo, self.target_combo):
-            combo["values"] = names
+        self.profile_combo["values"] = names
         self.refresh_project_label()
         self.load_rotation()
 
@@ -349,9 +293,8 @@ class FlowBotApp(tk.Tk):
 
     def set_busy(self, busy: bool) -> None:
         state = "disabled" if busy else "normal"
-        for button in (self.start_button, self.capcut_button, self.compare_button, self.clean_button):
+        for button in (self.start_button, self.capcut_button, self.clean_button):
             button.configure(state=state)
-        self.transfer_button.configure(state="disabled" if busy or not self.missing else "normal")
         self.stop_button.configure(state="normal" if busy else "disabled")
 
     @staticmethod
@@ -540,7 +483,6 @@ class FlowBotApp(tk.Tk):
             self.append_log(f"ERROR: bot tidak bisa dijalankan: {exc}\n")
             messagebox.showerror("Gagal", f"Bot tidak bisa dijalankan:\n{exc}")
             return
-        self.job_done = set()
         threading.Thread(target=self._read_process, args=(self.process,), daemon=True).start()
 
     def start(self) -> None:
@@ -627,10 +569,6 @@ class FlowBotApp(tk.Tk):
                         )
                         if found:
                             self.job_info["cleaned"] = found.group(1)
-                    if self.job == "transfer":
-                        for name in self.job_picked:
-                            if re.search(rf"\| {re.escape(name)} (berhasil dibuat|sudah ada di profil tujuan)", value):
-                                self.job_done.add(name)
                 else:
                     self._finished(int(value))
         except queue.Empty:
@@ -641,14 +579,6 @@ class FlowBotApp(tk.Tk):
     def _finished(self, code: int) -> None:
         self.process = None
         job, self.job = self.job, ""
-        if job == "compare":
-            self.set_busy(False)
-            self._compare_finished(code)
-            return
-        if job == "transfer":
-            self.set_busy(False)
-            self._transfer_finished(code)
-            return
         if job == "clean":
             self.set_busy(False)
             count = self.job_info.get("cleaned", "0")
@@ -790,60 +720,6 @@ class FlowBotApp(tk.Tk):
             self.status_var.set("Menghentikan...")
 
     # -------------------------------------------------------- characters
-    def swap_profiles(self) -> None:
-        source, target = self.source_var.get(), self.target_var.get()
-        self.source_var.set(target)
-        self.target_var.set(source)
-        self.load_last_compare()
-
-    def character_dir(self, source: str) -> Path:
-        return CHARACTER_ROOT / safe_name(source)
-
-    def compare_file(self, source: str, target: str) -> Path:
-        return self.character_dir(source) / f"_banding_{safe_name(target)}.json"
-
-    def show_compare(self, missing: list[str], existing: list[str]) -> None:
-        self.missing = list(missing)
-        self.missing_list.delete(0, "end")
-        self.existing_list.delete(0, "end")
-        for name in missing:
-            self.missing_list.insert("end", name)
-        for name in existing:
-            self.existing_list.insert("end", name)
-        self.select_all_missing()
-        idle = self.process is None and not self.job and self.pending_launch is None
-        self.transfer_button.configure(state="normal" if missing and idle else "disabled")
-
-    def load_last_compare(self) -> None:
-        source, target = self.source_var.get(), self.target_var.get()
-        path = self.compare_file(source, target)
-        data = None
-        if path.is_file():
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                data = None
-        if not data:
-            self.show_compare([], [])
-            self.char_info_var.set(f"{source} → {target}: belum dicek. Klik '1. Cek karakter'.")
-            return
-        # Buang yang sudah berhasil dipindah sebelumnya.
-        moved = {n.casefold() for n in data.get("moved", [])}
-        missing = [n for n in data.get("missing", []) if n.casefold() not in moved]
-        existing = data.get("existing", []) + [n for n in data.get("missing", []) if n.casefold() in moved]
-        self.show_compare(missing, existing)
-        self.char_info_var.set(
-            f"{source} → {target}: hasil cek {data.get('checked_at', '-')} • belum ada {len(missing)}, "
-            f"sudah ada {len(existing)}. Klik '1. Cek karakter' untuk cek ulang."
-        )
-
-    def select_all_missing(self) -> None:
-        if self.missing_list.size():
-            self.missing_list.selection_set(0, "end")
-
-    def open_character_folder(self) -> None:
-        self.open_folder(self.character_dir(self.source_var.get()))
-
     def clean_untitled(self) -> None:
         """Hapus karakter 'Karakter tanpa judul' (tanpa nama) di profil yang dipilih di atas."""
         if self.process is not None or self.job or self.pending_launch is not None:
@@ -871,133 +747,6 @@ class FlowBotApp(tk.Tk):
             args.append("--check-only")
         title = "Cek karakter tanpa nama" if preview else "Hapus karakter tanpa nama"
         self.run_worker("clean", args, f"{title} | profil {name}")
-
-    def _pair(self) -> tuple[str, str, str, str] | None:
-        source, target = self.source_var.get(), self.target_var.get()
-        if source == target:
-            messagebox.showwarning("Profil sama", "Profil sumber dan tujuan harus berbeda (misal A → B).")
-            return None
-        source_url = self.ensure_url(source)
-        if not source_url:
-            return None
-        target_url = self.ensure_url(target)
-        if not target_url:
-            return None
-        return source, target, source_url, target_url
-
-    def compare_characters(self) -> None:
-        if self.process is not None or self.job or self.pending_launch is not None:
-            return
-        pair = self._pair()
-        if pair is None:
-            return
-        source, target, source_url, target_url = pair
-        if not messagebox.askokcancel(
-            "Cek karakter",
-            f"Bot akan membuka Flow profil '{target}' lalu '{source}' untuk membandingkan karakter, "
-            f"dan mengunduh gambar karakter yang belum ada di '{target}'.\n\n"
-            "Tutup dulu semua jendela Chrome kedua profil ini. Lanjut?",
-        ):
-            return
-        self.show_compare([], [])
-        self.char_info_var.set(f"Mengecek {source} → {target}...")
-        self.job_info = {"source": source, "target": target}
-        args = ["--profile-dir", str(self.profile_path(source)), "--url", source_url,
-                "--profile-name", source, "--compare-characters",
-                "--target-profile-dir", str(self.profile_path(target)), "--target-url", target_url,
-                "--target-name", target]
-        self.run_worker("compare", args, f"Cek karakter {source} → {target}")
-
-    def _compare_finished(self, code: int) -> None:
-        source, target = self.job_info.get("source", ""), self.job_info.get("target", "")
-        if code == 6:
-            self.status_var.set("Project tidak ditemukan")
-            messagebox.showerror("Project Flow tidak ditemukan",
-                                 f"Salah satu profil ({source} / {target}) tidak bisa membuka project-nya. "
-                                 "Periksa 'URL project' kedua profil. Detail di panel Progres.")
-            return
-        if code != 0:
-            self.status_var.set(f"Cek karakter gagal (kode {code})")
-            messagebox.showerror("Cek karakter gagal", "Lihat panel Progres untuk detail.")
-            return
-        self.source_var.set(source)
-        self.target_var.set(target)
-        self.load_last_compare()
-        self.status_var.set(f"Cek selesai: {len(self.missing)} karakter belum ada di {target}")
-        if not self.missing and not self.existing_list.size():
-            messagebox.showwarning(
-                "Cek karakter",
-                f"Tidak ada karakter yang terbaca di profil '{source}'. Pastikan project-nya berisi karakter "
-                "(menu Karakter/Characters di Flow). Detail di panel Progres.",
-            )
-        elif not self.missing:
-            messagebox.showinfo("Cek karakter", f"Semua karakter {source} sudah ada di {target}. Tidak ada yang perlu dipindah.")
-        else:
-            messagebox.showinfo(
-                "Cek karakter",
-                f"{len(self.missing)} karakter {source} belum ada di {target}.\n"
-                "Pilih karakter di daftar kiri lalu klik '2. Pindahkan yang dipilih'.",
-            )
-
-    def transfer_characters(self) -> None:
-        if self.process is not None or self.job or self.pending_launch is not None:
-            return
-        picked = [self.missing_list.get(i) for i in self.missing_list.curselection()]
-        if not picked:
-            messagebox.showinfo("Pilih karakter", "Pilih minimal satu karakter di daftar 'BELUM ADA'.")
-            return
-        source, target = self.source_var.get(), self.target_var.get()
-        if source == target:
-            messagebox.showwarning("Profil sama", "Profil sumber dan tujuan harus berbeda.")
-            return
-        target_url = self.ensure_url(target)
-        if not target_url:
-            return
-        folder = self.character_dir(source)
-        if not (folder / "karakter.json").is_file():
-            messagebox.showwarning("Belum dicek", "Klik '1. Cek karakter' dulu agar gambar karakter diunduh.")
-            return
-        if not messagebox.askokcancel(
-            "Pindahkan karakter",
-            f"Buat {len(picked)} karakter di profil '{target}':\n\n" + "\n".join(f"• {n}" for n in picked[:20])
-            + ("\n…" if len(picked) > 20 else "") + f"\n\nTutup dulu Chrome profil '{target}'. Lanjut?",
-        ):
-            return
-        self.job_info = {"source": source, "target": target, "names": json.dumps(picked)}
-        names_file = APP_DIR / "runtime" / "pindah_karakter.json"
-        names_file.parent.mkdir(parents=True, exist_ok=True)
-        names_file.write_text(json.dumps(picked, ensure_ascii=False), encoding="utf-8")
-        self.job_picked = list(picked)
-        args = ["--profile-dir", str(self.profile_path(target)), "--url", target_url,
-                "--profile-name", target, "--import-characters", "--character-folder", str(folder),
-                "--names-file", str(names_file)]
-        self.run_worker("transfer", args, f"Pindah {len(picked)} karakter {source} → {target}")
-
-    def _transfer_finished(self, code: int) -> None:
-        source, target = self.job_info.get("source", ""), self.job_info.get("target", "")
-        picked = json.loads(self.job_info.get("names", "[]"))
-        # Dihitung dari keluaran proses pindah yang barusan, baris demi baris.
-        done = [n for n in picked if n in self.job_done]
-        path = self.compare_file(source, target)
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            data["moved"] = sorted({*data.get("moved", []), *done}, key=str.casefold)
-            path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-        except (OSError, ValueError):
-            pass
-        self.load_last_compare()
-        if code == 6:
-            self._project_not_found(target)
-        elif code == 0:
-            self.status_var.set(f"Pindah karakter selesai: {len(done)} karakter di {target}")
-            messagebox.showinfo("Pindah karakter selesai", f"{len(done)} karakter sekarang ada di profil '{target}'.")
-        else:
-            failed = [n for n in picked if n not in done]
-            self.status_var.set(f"Pindah karakter: {len(failed)} gagal")
-            messagebox.showwarning(
-                "Sebagian gagal",
-                f"Berhasil: {len(done)}\nGagal: {', '.join(failed) or '-'}\n\nLihat panel Progres, lalu coba pindahkan lagi.",
-            )
 
 
 if __name__ == "__main__":
