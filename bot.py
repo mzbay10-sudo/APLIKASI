@@ -224,22 +224,114 @@ def is_marked_done(row: dict[str, Any]) -> bool:
 
 
 def prompt_rows(path: Path, config: dict[str, Any]) -> list[tuple[int, dict[str, Any]]]:
-    """Ambil baris berprompt yang belum bertanda SELESAI/SEBAGIAN di Excel."""
+    """Ambil baris berprompt yang belum bertanda SELESAI/SEBAGIAN di Excel.
+    Tanda yang tersimpan di <nama>_TANDA.xlsx (Excel sedang dibuka saat run
+    sebelumnya) ikut dihitung, supaya scene yang sudah jadi tidak diulang."""
     config = with_detected_columns(config, read_headers(path, config.get("sheet_name")))
     start_row = int(config.get("start_row", 2))
     prompt_column = str(config.get("prompt", {}).get("column", "1"))
+    pending = pending_marks(path, config)
     return [
         (number, row)
         for number, row in read_rows(path, config.get("sheet_name"))
         if number >= start_row and not is_empty(row.get(prompt_column)) and not is_marked_done(row)
+        and not _pending_done(pending.get(number), row.get(prompt_column))
     ]
+
+
+def output_name(input_path: Path) -> str:
+    return re.sub(r'[<>:"/\\|?*]+', "_", input_path.stem).strip(" .") or "hasil"
+
+
+def marks_fallback_path(input_path: Path, config: dict[str, Any]) -> Path:
+    """<downloads>/<nama>/<nama>_TANDA.xlsx: tanda saat Excel asli sedang dibuka."""
+    root = resolve_path(str(config.get("download", {}).get("root_folder", "downloads")))
+    return root / output_name(input_path) / f"{input_path.stem}_TANDA{input_path.suffix}"
+
+
+def pending_marks(input_path: Path, config: dict[str, Any]) -> dict[int, dict[str, Any]]:
+    """Baca tanda dari <nama>_TANDA.xlsx yang belum masuk ke Excel asli.
+    Hasil: {nomor baris: {STATUS, FILE GAMBAR, WAKTU, _prompt}}."""
+    if input_path.suffix.casefold() not in {".xlsx", ".xlsm"}:
+        return {}
+    fallback = marks_fallback_path(input_path, config)
+    if not fallback.is_file():
+        return {}
+    try:
+        workbook = load_workbook(fallback, read_only=True, data_only=True)
+    except Exception as exc:
+        logging.warning("TANDA EXCEL | %s tidak terbaca: %s", fallback.name, exc)
+        return {}
+    try:
+        sheet_name = config.get("sheet_name")
+        sheet = workbook[sheet_name] if sheet_name else workbook.active
+        iterator = sheet.iter_rows(values_only=True)
+        headers = [str(v).strip() if v is not None else "" for v in next(iterator, ())]
+        lookup = {h.casefold(): i for i, h in enumerate(headers) if h}
+        if MARK_STATUS.casefold() not in lookup:
+            return {}
+        prompt_column = str(config.get("prompt", {}).get("column", "1"))
+        prompt_index = lookup.get(prompt_column.casefold())
+        if prompt_index is None and prompt_column.isdigit():
+            prompt_index = int(prompt_column) - 1
+        result: dict[int, dict[str, Any]] = {}
+        for number, values in enumerate(iterator, start=2):
+            def cell(name: str) -> Any:
+                index = lookup.get(name.casefold())
+                return values[index] if index is not None and index < len(values) else None
+            status = cell(MARK_STATUS)
+            if is_empty(status):
+                continue
+            prompt = values[prompt_index] if prompt_index is not None and prompt_index < len(values) else None
+            result[number] = {
+                MARK_STATUS: status, MARK_FILES: cell(MARK_FILES), MARK_TIME: cell(MARK_TIME), "_prompt": prompt,
+            }
+        return result
+    finally:
+        workbook.close()
+
+
+def _same_text(a: Any, b: Any) -> bool:
+    return " ".join(str(a or "").split()) == " ".join(str(b or "").split())
+
+
+def _pending_done(mark: dict[str, Any] | None, prompt: Any) -> bool:
+    """Baris sudah SELESAI/SEBAGIAN/DITOLAK menurut _TANDA.xlsx (dan prompt-nya sama)."""
+    return bool(
+        mark and _same_text(mark.get("_prompt"), prompt)
+        and str(mark.get(MARK_STATUS) or "").strip().casefold().startswith(DONE_PREFIXES)
+    )
+
+
+def status_summary(path: Path, config: dict[str, Any]) -> dict[str, int]:
+    """Hitung scene SELESAI/SEBAGIAN/GAGAL/DITOLAK/BELUM di satu Excel (termasuk _TANDA.xlsx)."""
+    config = with_detected_columns(config, read_headers(path, config.get("sheet_name")))
+    start_row = int(config.get("start_row", 2))
+    prompt_column = str(config.get("prompt", {}).get("column", "1"))
+    pending = pending_marks(path, config)
+    counts = {"selesai": 0, "sebagian": 0, "gagal": 0, "ditolak": 0, "belum": 0}
+    for number, row in read_rows(path, config.get("sheet_name")):
+        if number < start_row or is_empty(row.get(prompt_column)):
+            continue
+        status = next((v for k, v in row.items() if str(k).casefold() == MARK_STATUS.casefold()), None)
+        mark = pending.get(number)
+        if mark and _same_text(mark.get("_prompt"), row.get(prompt_column)) and (
+            is_empty(status) or _pending_done(mark, row.get(prompt_column))
+        ):
+            status = mark.get(MARK_STATUS)
+        if is_empty(status):
+            counts["belum"] += 1
+        else:
+            text = str(status).strip().casefold()
+            counts[next((k for k in ("selesai", "sebagian", "ditolak") if text.startswith(k)), "gagal")] += 1
+    return counts
 
 
 def config_for_input(config: dict[str, Any], input_path: Path) -> dict[str, Any]:
     """Buat folder dan nama hasil berdasarkan nama file input."""
     headers = read_headers(input_path, config.get("sheet_name"))
     result = with_detected_columns(config, headers)
-    safe_name = re.sub(r'[<>:"/\\|?*]+', "_", input_path.stem).strip(" .") or "hasil"
+    safe_name = output_name(input_path)
     root = resolve_path(str(result.get("download", {}).get("root_folder", "downloads")))
     result["download"]["folder"] = str(root / safe_name)
     result["download"]["base_name"] = safe_name
@@ -374,6 +466,53 @@ class ExcelMarker:
                 letter = header.column_letter
                 self.sheet.column_dimensions[letter].width = widths[name]
             self.columns[name] = column
+        self.pending_fallback = False
+        self.merge_pending_marks(config)
+
+    @staticmethod
+    def kind_of(status: Any) -> str:
+        text = str(status or "").strip().casefold()
+        return next((k for k in ("selesai", "sebagian", "ditolak") if text.startswith(k)), "gagal")
+
+    def merge_pending_marks(self, config: dict[str, Any]) -> None:
+        """Pindahkan tanda dari <nama>_TANDA.xlsx (run saat Excel dibuka) ke Excel asli."""
+        pending = pending_marks(self.path, config)
+        if not pending:
+            return
+        self.pending_fallback = True
+        prompt_column = str(config.get("prompt", {}).get("column", "1"))
+        prompt_index = self.headers.get(prompt_column.casefold())
+        if prompt_index is None and prompt_column.isdigit():
+            prompt_index = int(prompt_column)
+        merged = 0
+        for row_number, mark in pending.items():
+            prompt = self.sheet.cell(row=row_number, column=prompt_index).value if prompt_index else None
+            if not _same_text(prompt, mark.get("_prompt")):
+                continue  # baris Excel sudah bergeser/diubah -> jangan salah tempel
+            status_cell = self.sheet.cell(row=row_number, column=self.columns[MARK_STATUS])
+            current = status_cell.value
+            new_kind = self.kind_of(mark[MARK_STATUS])
+            if not is_empty(current) and (self.kind_of(current) != "gagal" or new_kind == "gagal"):
+                continue  # tanda di Excel asli sudah sama baiknya
+            fill = self._fill("solid", fgColor=self.FILLS[new_kind])
+            status_cell.value = mark[MARK_STATUS]
+            status_cell.fill = fill
+            status_cell.font = self._font(bold=True)
+            status_cell.alignment = self._alignment(vertical="top", wrap_text=True)
+            files_cell = self.sheet.cell(row=row_number, column=self.columns[MARK_FILES])
+            old = [x for x in str(files_cell.value or "").splitlines() if x.strip()]
+            new = [x for x in str(mark.get(MARK_FILES) or "").splitlines() if x.strip()]
+            files = old + [x for x in new if x not in old]
+            files_cell.value = "\n".join(files) if files else None
+            files_cell.fill = fill
+            files_cell.alignment = self._alignment(vertical="top", wrap_text=True)
+            self.sheet.cell(row=row_number, column=1).fill = fill
+            self.sheet.cell(row=row_number, column=self.columns[MARK_TIME], value=mark.get(MARK_TIME))
+            merged += 1
+        if merged:
+            logging.info(
+                "TANDA EXCEL | %s tanda dari %s dipindahkan ke %s", merged, self.fallback.name, self.path.name
+            )
 
     def fill_narration(self) -> None:
         """Isi kolom NARASI untuk semua baris dari .docx yang cocok (sekali di awal)."""
@@ -473,6 +612,14 @@ class ExcelMarker:
         try:
             self.workbook.save(temp)
             os.replace(temp, self.path)
+            if self.pending_fallback or self.warned_locked:
+                # Semua tanda sudah ada di Excel asli -> salinan _TANDA tidak diperlukan lagi.
+                try:
+                    self.fallback.unlink(missing_ok=True)
+                    logging.info("TANDA EXCEL | %s sudah digabung ke %s", self.fallback.name, self.path.name)
+                except OSError:
+                    pass
+                self.pending_fallback = False
             return
         except PermissionError:
             try:
@@ -494,6 +641,8 @@ def open_marker(input_path: Path, config: dict[str, Any]) -> ExcelMarker | None:
     try:
         marker = ExcelMarker(input_path, config)
         marker.fill_narration()
+        if marker.pending_fallback:
+            marker.save()  # tanda dari _TANDA.xlsx langsung masuk ke Excel asli
         return marker
     except Exception:
         logging.exception("Penanda Excel tidak dapat disiapkan untuk %s; generate tetap berjalan", input_path.name)
@@ -3673,6 +3822,9 @@ def sync_characters_before_generate(
             import_characters(page, config, folder, names, report=moved, deadline=sync_deadline)
         except Exception as exc:
             logging.warning("SINKRON KARAKTER | pindah dari %s gagal: %s", folder.name, exc)
+    if moved:
+        # Katalog profil ini ikut memuat karakter yang baru dipindah.
+        save_catalog_entry(config, profile, [c["name"] for c in listed] + [missing[k] for k in moved if k in missing])
     for name in not_found:
         logging.info("SINKRON KARAKTER | %s tidak ada di semua profil -> generate tetap jalan (karakter dari prompt)", name)
     still_missing = {k for k in missing if k not in moved}

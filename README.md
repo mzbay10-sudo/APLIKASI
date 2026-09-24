@@ -29,6 +29,20 @@ Pengaturan ini ada di bagian `model_schedule` pada `config.json`. Pemilihan dila
 
 Google Chrome yang sudah terpasang di Windows dijalankan oleh Playwright dengan profil persisten di `runtime/browser-profile`. Folder ini hanya milik bot dan tidak memakai profil, history, extension, atau sesi Chrome pribadi.
 
+## Kemudahan saat generate (v8)
+
+- **Perkiraan sisa waktu:** baris status di bawah menampilkan `sisa ±X menit` dari rata-rata waktu per prompt.
+- **Ulang otomatis sekali:** setelah semua file selesai, scene yang `GAGAL` (error sementara) langsung dicoba sekali lagi dengan profil yang sama. Kalau tidak ada satu pun scene yang berhasil, pengulangan tidak dilakukan karena masalahnya bukan sementara. Bisa dimatikan dengan `"auto_retry_failed": false` di `config.json`.
+- **Ringkasan akhir:** jumlah SELESAI / SEBAGIAN / GAGAL / DITOLAK / BELUM per Excel ditampilkan di panel Progres dan jendela Selesai.
+
+## Uji coba tanpa Google Flow
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
+
+Menguji pembacaan Excel, dry-run, penanda Excel (termasuk saat Excel terbuka), sinkron karakter antar profil dengan profil tiruan, serta alur aplikasi (pindah profil, ulang otomatis, ringkasan) dengan bot tiruan. Untuk ikut menguji Excel sungguhan (memakai salinan, file asli tidak diubah): `$env:FLOWBOT_SAMPLE_XLSX = "data\Episode_041.xlsx"` sebelum perintah di atas.
+
 ## Tanda di Excel + narasi (v7)
 
 Setiap baris yang selesai langsung ditandai di Excel sumber, pada 4 kolom baru di sebelah kanan:
@@ -43,7 +57,7 @@ Setiap baris yang selesai langsung ditandai di Excel sumber, pada 4 kolom baru d
 - **Nama file per scene:** `downloads/Episode_041/Episode_041 S001-1.jpeg`. Nomor `S001` diambil dari kolom `Scene #`, jadi nomornya tidak bergeser walaupun ada baris yang gagal. Kalau tidak ada kolom `Scene #`, nomor dihitung dari baris Excel (baris 2 = S001).
 - **Narasi:** letakkan file .docx narasi di folder yang sama dengan Excel. Bot memilih .docx yang namanya memuat nama Excel atau nomor episodenya, misalnya `Episode_041.xlsx` dengan `BTS_MODE_FINAL_Episode_041_TTS_SAFE.docx`. `¶N` menunjuk ke paragraf ke-N (mulai 0). Source Ref tanpa nomor, seperti `¶soulsearcha`, dibiarkan kosong.
 - **Lanjut otomatis:** saat dijalankan ulang, baris `SELESAI`/`SEBAGIAN` dilewati dan hanya baris `GAGAL` atau yang belum bertanda yang diproses. Untuk mengulang satu scene, kosongkan sel `STATUS`-nya.
-- **Excel sedang dibuka:** kalau Excel sedang terbuka, tanda disimpan ke `downloads/<nama>/<nama>_TANDA.xlsx`. Tutup Excel saat bot berjalan supaya file asli yang diperbarui.
+- **Excel sedang dibuka:** saat klik Mulai, aplikasi mengingatkan kalau Excel masih terbuka. Kalau tetap lanjut, tanda disimpan sementara ke `downloads/<nama>/<nama>_TANDA.xlsx`. Pada run berikutnya tanda itu otomatis digabung ke Excel asli dan scene yang sudah selesai **tidak di-generate ulang**. Setelah tergabung, file `_TANDA` dihapus.
 - **Cadangan:** sebelum tanda pertama ditulis, salinan Excel asli disimpan sebagai `downloads/<nama>/<nama>_ASLI.xlsx`.
 - **Format kolom:** Excel dengan header `Prompt` yang tidak berada di kolom pertama (format STORY MODE: `Scene #`, `Source Ref`, `Prompt`, `Character 1..3`) dibaca berdasarkan nama header. Format lama (prompt di kolom 1) tetap dibaca per posisi seperti sebelumnya. `Key Artifact` tidak dipasang sebagai referensi.
 
@@ -106,14 +120,9 @@ Untuk setiap baris, bot hanya menekan Create satu kali dan mengunduh semua hasil
 
 Kartu aset dengan ikon orang di pojok kiri atas dikenali sebagai **Karakter** dan selalu dilindungi: tidak dianggap sebagai hasil generate, tidak diunduh, dan tidak dihapus. Panel progres mencatat `KARAKTER DILINDUNGI` atau `HASIL GENERATE` untuk memudahkan audit.
 
-## Pindah Karakter antar Profil (tab kedua aplikasi)
+## Karakter antar profil (otomatis, tanpa tab terpisah)
 
-1. Pilih **Dari profil (A)** dan **Ke profil (B)**, misalnya Renegade Immortal → BTS atau A → C. Tombol **Tukar** membalik arah.
-2. Klik **1. Cek karakter**. Bot membuka Flow profil tujuan lalu profil sumber, lalu membandingkan nama karakternya.
-   - **BELUM ADA di tujuan**: hanya karakter ini yang gambarnya diunduh ke `downloads\_KARAKTER\<nama profil sumber>\` (plus `karakter.json`).
-   - **SUDAH ADA di tujuan**: dilewati dan tidak dipindah.
-3. Pilih karakter di daftar kiri (Shift/Ctrl untuk beberapa, atau **Pilih semua**), lalu klik **2. Pindahkan yang dipilih**. Bot membuat karakter baru di profil tujuan dengan gambar dan nama yang sama.
-4. Tutup semua jendela Chrome kedua profil sebelum menekan tombol.
+Aplikasi hanya punya satu layar: **Generate Gambar**. Tab **Pindah Karakter antar Profil** sudah dihapus karena tidak diperlukan lagi. Cukup pilih Excel lalu klik **Mulai generate**. Karakter yang dipakai Excel tetapi belum ada di profil yang sedang dipakai otomatis dicari di profil lain lalu dibuat di profil ini sebelum generate dimulai (lihat **Sinkron karakter otomatis sebelum generate** di bawah).
 
 Flow berbahasa Inggris maupun Indonesia sama-sama didukung.
 
@@ -172,4 +181,4 @@ Kalau upload gambar ditolak Flow atau nama gagal tersimpan, bot sekarang:
 1. Mengisi ulang nama (10 cara cadangan) lalu membuka ulang halaman karakter untuk memastikan nama benar-benar tersimpan.
 2. Kalau tetap gagal, bot menghapus **hanya draf yang barusan dibuatnya sendiri**, dan hanya kalau judulnya masih kosong. Karakter yang punya nama tidak pernah dihapus.
 
-Untuk membersihkan sisa karakter tanpa nama dari kegagalan sebelumnya, buka tab **Pindah Karakter**, pilih profil di **Profil** (atas), lalu klik **Hapus karakter tanpa nama**. Pilih **YES** untuk menghapus, atau **NO** untuk cek saja (hanya dihitung, tidak ada yang dihapus). Bot mengecek label dan gambar kartu (supaya kartu tidak tertukar), membuka setiap kartu tanpa nama, menunggu halamannya termuat, dan membaca namanya 2 kali. Karakter hanya dihapus kalau judulnya memang kosong. Kalau namanya tidak terbaca dengan pasti, karakter itu dilewati.
+Untuk membersihkan sisa karakter tanpa nama dari kegagalan sebelumnya, pilih profil di **Profil** (atas), lalu klik **Hapus karakter tanpa nama** (kanan bawah bagian Generate Gambar). Pilih **YES** untuk menghapus, atau **NO** untuk cek saja (hanya dihitung, tidak ada yang dihapus). Bot mengecek label dan gambar kartu (supaya kartu tidak tertukar), membuka setiap kartu tanpa nama, menunggu halamannya termuat, dan membaca namanya 2 kali. Karakter hanya dihapus kalau judulnya memang kosong. Kalau namanya tidak terbaca dengan pasti, karakter itu dilewati.
